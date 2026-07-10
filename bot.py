@@ -30,7 +30,22 @@ from urllib.parse import urlparse, parse_qs, unquote, quote_plus, urlencode
 # ─── NEW IMPORTS ──────────────────────────────────────────────────────────────
 import tls_client
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-from playwright_stealth import stealth_async  # pip install playwright-stealth
+try:
+    from playwright_stealth import stealth_async
+except ImportError:
+    # fallback: define a minimal stealth function
+    async def stealth_async(page):
+        await page.add_init_script("""
+            // Minimal stealth: mask automation indicators
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            // WebRTC IP masking (already handled by Chromium flags)
+            const origRTCPeerConnection = window.RTCPeerConnection;
+            window.RTCPeerConnection = function(...args) {
+                return new origRTCPeerConnection(...args);
+            };
+        """)
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
