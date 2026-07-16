@@ -13,6 +13,10 @@ All issues resolved:
 """
 
 import asyncio, re, random, logging, urllib.parse, os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
