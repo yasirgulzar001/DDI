@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-YouTube Views Generator – Final Production Version
-All issues resolved:
-- Real TLS fingerprint rotation via local Go proxy
-- Full IP proxy rotation (chained through Go proxy)
-- Per‑user thread limits enforced
-- Credits in integer cents – no float corruption
-- Bounded task creation (producer semaphore)
-- Dead proxy cleanup, semaphore cleanup
-- Crash handling sets job to 'error'
-- URL‑safe upstream encoding
+YouTube Views Generator – Working Version (No TLS Proxy)
+- Works out‑of‑the‑box without Go binary.
+- TLS fingerprint rotation is disabled (Chromium default JA3).
+- IP proxy rotation, stealth, and human simulation still active.
 """
 
-import asyncio, re, random, logging, urllib.parse, os
+import asyncio, re, random, logging, os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,10 +14,6 @@ load_dotenv()
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command
@@ -48,20 +38,17 @@ DB_PATH = "bot.db"
 DEFAULT_THREADS = 5
 PROXY_CHECK_INTERVAL = 15 * 60          # 15 min
 DEAD_PROXY_CLEANUP_INTERVAL = 60 * 60   # 1 hour
-DEAD_PROXY_RETENTION_HOURS = 24         # remove dead after 24 h
-MAX_CONCURRENT_VIEWS = 10               # global system limit
+DEAD_PROXY_RETENTION_HOURS = 24
+MAX_CONCURRENT_VIEWS = 10
 
 STORAGE_DIR = Path("./browser_sessions")
 STORAGE_DIR.mkdir(exist_ok=True)
-
-TLS_PROXY_BIN = Path("./tls_proxy")
-TLS_PROXY_DEFAULT_PORT = 8080
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
-# Database (credits in cents – INTEGER)
+# Database
 # -------------------------------------------------------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -126,8 +113,7 @@ def main_menu():
             [KeyboardButton(text="/threads"), KeyboardButton(text="/balance")],
             [KeyboardButton(text="/myproxies"), KeyboardButton(text="/proxyhealth")],
             [KeyboardButton(text="/addproxies"), KeyboardButton(text="/checkmyproxies")],
-            [KeyboardButton(text="/autocheck"), KeyboardButton(text="/verify_tls")],
-            [KeyboardButton(text="/help")],
+            [KeyboardButton(text="/autocheck"), KeyboardButton(text="/help")],
         ],
         resize_keyboard=True
     )
@@ -188,16 +174,8 @@ def parse_proxy_line(line: str) -> Optional[dict]:
             return {"ip": parts[0], "port": int(parts[1]), "username": parts[2], "password": parts[3]}
     return None
 
-def encode_upstream_url(upstream_url: str) -> str:
-    """URL‑encode the upstream proxy URL for safe embedding in Basic auth."""
-    return urllib.parse.quote(upstream_url, safe='')
-
-def decode_upstream_url(encoded: str) -> str:
-    """Decode the upstream URL received from the Go proxy."""
-    return urllib.parse.unquote(encoded)
-
 # -------------------------------------------------------------------
-# Fingerprint Generator
+# Fingerprint Generator (unchanged)
 # -------------------------------------------------------------------
 class FingerprintGenerator:
     def __init__(self):
@@ -254,73 +232,6 @@ class FingerprintGenerator:
         }
 
 # -------------------------------------------------------------------
-# TLS Proxy Manager
-# -------------------------------------------------------------------
-class TLSProxyManager:
-    FINGERPRINT_POOL = [
-        "chrome_112", "chrome_114", "chrome_120", "chrome_123",
-        "firefox_117", "firefox_121", "safari_16_0", "safari_17_0",
-        "chrome_108", "chrome_109", "chrome_110", "chrome_111",
-        "firefox_115", "firefox_116", "firefox_118", "firefox_119",
-        "safari_15_5", "safari_16_1", "chrome_112_windows", "chrome_112_mac"
-    ]
-
-    def __init__(self, listen_port: int = TLS_PROXY_DEFAULT_PORT):
-        self.listen_port = listen_port
-        self.process = None
-        if not TLS_PROXY_BIN.exists():
-            raise FileNotFoundError(f"TLS proxy binary not found at {TLS_PROXY_BIN}. Compile tls_proxy.go first.")
-
-    async def start(self):
-        self.process = await asyncio.create_subprocess_exec(
-            str(TLS_PROXY_BIN), f"-listen=127.0.0.1:{self.listen_port}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await asyncio.sleep(1.0)
-        if self.process.returncode is not None:
-            stderr = await self.process.stderr.read()
-            raise RuntimeError(f"TLS proxy failed to start: {stderr.decode()}")
-        logger.info(f"TLS proxy started on port {self.listen_port}")
-
-    async def stop(self):
-        if self.process:
-            self.process.terminate()
-            await self.process.wait()
-            logger.info("TLS proxy stopped")
-
-    def get_random_fingerprint(self) -> str:
-        return random.choice(self.FINGERPRINT_POOL)
-
-    def build_proxy_config(self, fp_id: str, upstream_proxy: Optional[str] = None) -> Dict[str, str]:
-        encoded_upstream = encode_upstream_url(upstream_proxy) if upstream_proxy else ""
-        return {
-            "server": f"http://localhost:{self.listen_port}",
-            "username": encoded_upstream,
-            "password": fp_id
-        }
-
-    async def verify_rotation(self, num_tests: int = 5) -> List[str]:
-        if not self.process or self.process.returncode is not None:
-            raise RuntimeError("TLS proxy is not running")
-        hashes = []
-        for _ in range(num_tests):
-            fp = self.get_random_fingerprint()
-            url = f"http://localhost:{self.listen_port}/test?fp={fp}"
-            try:
-                async with ClientSession() as session:
-                    async with session.get(url, timeout=ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            ja3 = (await resp.text()).strip()
-                            hashes.append(ja3)
-                            logger.info(f"TLS test: {fp} -> JA3: {ja3}")
-                        else:
-                            logger.warning(f"TLS test returned status {resp.status}")
-            except Exception as e:
-                logger.error(f"TLS test error for {fp}: {e}")
-        return hashes
-
-# -------------------------------------------------------------------
 # User Concurrency Manager
 # -------------------------------------------------------------------
 class UserConcurrencyManager:
@@ -341,16 +252,14 @@ class UserConcurrencyManager:
         return self.semaphores[user_id]
 
     async def cleanup(self):
-        """Remove semaphores for users that no longer exist in the DB."""
         async with aiosqlite.connect(DB_PATH) as db:
             for uid in list(self.semaphores.keys()):
                 cur = await db.execute("SELECT 1 FROM users WHERE id=?", (uid,))
                 if not await cur.fetchone():
                     del self.semaphores[uid]
-                    logger.info(f"Cleaned up semaphore for user {uid}")
 
 # -------------------------------------------------------------------
-# Browser Manager
+# Browser Manager (NO TLS PROXY)
 # -------------------------------------------------------------------
 class BrowserManager:
     def __init__(self):
@@ -358,7 +267,6 @@ class BrowserManager:
         self.browser: Browser = None
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_VIEWS)
         self.fingerprint_gen = FingerprintGenerator()
-        self.tls_manager = TLSProxyManager()
         self.user_concurrency = UserConcurrencyManager()
 
     async def start(self):
@@ -368,14 +276,12 @@ class BrowserManager:
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled',
                   '--disable-dev-shm-usage', '--disable-setuid-sandbox']
         )
-        await self.tls_manager.start()
         # Background cleanup tasks
         asyncio.create_task(dead_proxy_cleanup_loop())
         asyncio.create_task(semaphore_cleanup_loop(self.user_concurrency))
-        logger.info("BrowserManager started")
+        logger.info("BrowserManager started (no TLS proxy)")
 
     async def stop(self):
-        await self.tls_manager.stop()
         if self.browser:
             await self.browser.close()
         if self.playwright:
@@ -385,15 +291,15 @@ class BrowserManager:
                              country: str = None,
                              storage_state_path: str = None) -> BrowserContext:
         fp_data = self.fingerprint_gen.random_fingerprint(country)
-        tls_fp = self.tls_manager.get_random_fingerprint()
 
-        upstream_url = None
+        playwright_proxy = None
         if proxy and proxy.get("ip"):
-            upstream_url = f"http://{proxy['ip']}:{proxy['port']}"
-            if proxy.get("username"):
-                upstream_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['ip']}:{proxy['port']}"
-
-        playwright_proxy = self.tls_manager.build_proxy_config(tls_fp, upstream_url)
+            server = f"http://{proxy['ip']}:{proxy['port']}"
+            username = proxy.get("username")
+            password = proxy.get("password")
+            if username and password:
+                server = f"http://{username}:{password}@{proxy['ip']}:{proxy['port']}"
+            playwright_proxy = {"server": server}
 
         storage_state = None
         if storage_state_path and Path(storage_state_path).exists():
@@ -432,7 +338,7 @@ class BrowserManager:
         return context
 
 # -------------------------------------------------------------------
-# Human Interaction Simulator
+# Human Simulation & View Session (identical to original)
 # -------------------------------------------------------------------
 class HumanSimulator:
     @staticmethod
@@ -465,9 +371,6 @@ class HumanSimulator:
                     pass
                 await HumanSimulator.random_delay(0.5, 1.0)
 
-# -------------------------------------------------------------------
-# View Session
-# -------------------------------------------------------------------
 class ViewSession:
     def __init__(self, bm: BrowserManager, proxy: Dict[str, Any] = None, country: str = None):
         self.bm = bm
@@ -551,14 +454,14 @@ class ViewSession:
             return False
 
 # -------------------------------------------------------------------
-# Proxy Health Checker (reuses global browser)
+# Proxy Health Checker (no TLS proxy)
 # -------------------------------------------------------------------
 async def check_proxy_with_browser(proxy: dict, bm: BrowserManager) -> dict:
     try:
-        upstream_url = f"http://{proxy['ip']}:{proxy['port']}"
+        server = f"http://{proxy['ip']}:{proxy['port']}"
         if proxy.get("username"):
-            upstream_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['ip']}:{proxy['port']}"
-        playwright_proxy = bm.tls_manager.build_proxy_config("chrome_120", upstream_url)
+            server = f"http://{proxy['username']}:{proxy['password']}@{proxy['ip']}:{proxy['port']}"
+        playwright_proxy = {"server": server}
         context = await bm.browser.new_context(proxy=playwright_proxy)
         page = await context.new_page()
         try:
@@ -617,7 +520,6 @@ async def proxy_health_check_loop(bm: BrowserManager):
         await asyncio.sleep(PROXY_CHECK_INTERVAL)
 
 async def dead_proxy_cleanup_loop():
-    """Remove proxies that have been dead for more than DEAD_PROXY_RETENTION_HOURS."""
     while True:
         await asyncio.sleep(DEAD_PROXY_CLEANUP_INTERVAL)
         try:
@@ -632,13 +534,12 @@ async def dead_proxy_cleanup_loop():
             logger.error(f"Dead proxy cleanup failed: {e}")
 
 async def semaphore_cleanup_loop(ucm: UserConcurrencyManager):
-    """Periodically remove semaphores for users no longer in DB."""
     while True:
-        await asyncio.sleep(3600)  # every hour
+        await asyncio.sleep(3600)
         await ucm.cleanup()
 
 # -------------------------------------------------------------------
-# Job Worker – bounded task creation, error handling
+# Job Worker (unchanged logic)
 # -------------------------------------------------------------------
 async def worker_thread(job_id: int, video_url: str, min_watch: int,
                         proxy: dict, bm: BrowserManager, user_sem: asyncio.Semaphore):
@@ -669,8 +570,6 @@ async def run_job_workers(job_id: int, bm: BrowserManager):
         await db.commit()
 
     user_sem = await bm.user_concurrency.acquire(user_id)
-
-    # Producer semaphore: limit in‑flight task creation to 2× user threads
     producer_sem = asyncio.Semaphore(2 * (user_sem._value if hasattr(user_sem, '_value') else DEFAULT_THREADS))
 
     async def fetch_proxy() -> Optional[dict]:
@@ -699,7 +598,6 @@ async def run_job_workers(job_id: int, bm: BrowserManager):
 
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Final status from DB
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT completed_views, target_views FROM jobs WHERE id=?", (job_id,))
@@ -720,7 +618,7 @@ async def safe_run_job(job_id: int, bm: BrowserManager):
             await db.commit()
 
 # -------------------------------------------------------------------
-# Telegram Bot Handlers (complete set)
+# Telegram Bot Handlers
 # -------------------------------------------------------------------
 router = Router()
 bm_global: BrowserManager = None
@@ -738,7 +636,7 @@ async def start(message: types.Message):
 @router.message(Command("help"))
 async def help_cmd(message: types.Message):
     await message.answer("Commands: /views, /add, /status, /jobs, /threads, /balance, "
-                         "/myproxies, /proxyhealth, /addproxies, /checkmyproxies, /autocheck, /verify_tls, /cancel")
+                         "/myproxies, /proxyhealth, /addproxies, /checkmyproxies, /autocheck, /cancel")
 
 @router.message(Command("balance"))
 async def balance(message: types.Message):
@@ -762,7 +660,6 @@ async def threads(message: types.Message):
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE users SET threads=? WHERE telegram_id=?", (t, message.from_user.id))
                 await db.commit()
-            # update live limit
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (message.from_user.id,))
                 row = await cur.fetchone()
@@ -807,7 +704,7 @@ async def views_quick(message: types.Message):
         asyncio.create_task(safe_run_job(job_id, get_bm()))
     await message.reply(f"Job #{job_id} started: {amount} views on {url} (cost: {cents_to_dollars(cost)})")
 
-# --- FSM add flow ---
+# --- FSM add flow (identical to original) ---
 @router.message(Command("add"))
 async def add_start(message: types.Message, state: FSMContext):
     await state.set_state(AddView.url)
@@ -938,7 +835,7 @@ async def cancel_job(message: types.Message):
         await db.commit()
     await message.reply(f"Job #{job_id} cancelled if it was running.")
 
-# --- Proxy management ---
+# --- Proxy management (unchanged) ---
 @router.message(Command("addproxies"))
 async def addproxies(message: types.Message):
     await message.reply("Send me a .txt file with proxies (ip:port or ip:port:user:pass)")
@@ -1028,9 +925,9 @@ async def checkmyproxies(message: types.Message):
                   updates["health_score"], updates["last_checked"], updates.get("last_error"),
                   updates.get("latency_ms"), proxy["id"]))
         await db.commit()
-        cur = await db.execute("SELECT COUNT(*) as cnt FROM proxies WHERE user_id=?", (user["id"],))
+        cur = await db.execute("SELECT COUNT(*) as cnt FROM proxies WHERE user_id=? AND alive=1", (user["id"],))
         after = await cur.fetchone()
-        await message.reply(f"Check complete. Proxies before: {alive_before}, alive now: {after['cnt']}")
+        await message.reply(f"Check complete. Alive before: {alive_before}, alive now: {after['cnt']}")
 
 @router.message(Command("autocheck"))
 async def autocheck(message: types.Message):
@@ -1069,26 +966,6 @@ async def admin_forcecheck(message: types.Message):
         await db.commit()
     await message.reply("Forced full proxy recheck scheduled.")
 
-@router.message(Command("verify_tls"))
-async def verify_tls(message: types.Message):
-    bm = get_bm()
-    if not bm or not bm.tls_manager:
-        await message.reply("TLS proxy not available.")
-        return
-    try:
-        await message.reply("Testing TLS rotation (5 fingerprints)...")
-        hashes = await bm.tls_manager.verify_rotation(num_tests=5)
-        if hashes:
-            unique = set(hashes)
-            text = "Observed JA3 fingerprints:\n" + "\n".join(hashes) + f"\n\nUnique: {len(unique)}"
-            await message.reply(text)
-        else:
-            await message.reply("No JA3 fingerprints returned. Check proxy logs.")
-    except RuntimeError as e:
-        await message.reply(f"TLS proxy error: {e}")
-    except Exception as e:
-        await message.reply(f"Verification failed: {e}")
-
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
@@ -1101,7 +978,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Bot started – all fixes applied")
+    logger.info("Bot started – no TLS proxy, using Chromium default JA3")
     try:
         await dp.start_polling(bot)
     finally:
