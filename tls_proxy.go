@@ -1,5 +1,7 @@
-// tls_proxy.go – TLS fingerprint rotation proxy (works with utls v1.4.x+)
+// tls_proxy.go – TLS fingerprint rotation proxy (works with utls v1.5.0+)
 // Build:
+//   go mod init tlsproxy   (if not already done)
+//   go get github.com/refraction-networking/utls@v1.5.0
 //   go build -o tls_proxy tls_proxy.go
 
 package main
@@ -21,29 +23,29 @@ import (
 
 var listenAddr = flag.String("listen", "127.0.0.1:8080", "Address to listen on")
 
-// Fingerprint map using constants that exist in utls v1.4.x (no Chrome_108 etc.)
+// Fingerprint map – all constants exist in utls v1.5.0
 var fingerprintMap = map[string]utls.ClientHelloID{
-	// Chrome mappings -> HelloChrome_106 (the newest available in old utls)
-	"chrome_108":         utls.HelloChrome_106,
-	"chrome_109":         utls.HelloChrome_106,
-	"chrome_110":         utls.HelloChrome_106,
-	"chrome_111":         utls.HelloChrome_106,
-	"chrome_112":         utls.HelloChrome_106,
-	"chrome_114":         utls.HelloChrome_106,
-	"chrome_120":         utls.HelloChrome_106,
-	"chrome_123":         utls.HelloChrome_106,
-	"chrome_112_windows": utls.HelloChrome_106,
-	"chrome_112_mac":     utls.HelloChrome_106,
+	// Chrome versions → HelloChrome_100 (latest Chrome in utls v1.5.0)
+	"chrome_108":         utls.HelloChrome_100,
+	"chrome_109":         utls.HelloChrome_100,
+	"chrome_110":         utls.HelloChrome_100,
+	"chrome_111":         utls.HelloChrome_100,
+	"chrome_112":         utls.HelloChrome_100,
+	"chrome_114":         utls.HelloChrome_100,
+	"chrome_120":         utls.HelloChrome_100,
+	"chrome_123":         utls.HelloChrome_100,
+	"chrome_112_windows": utls.HelloChrome_100,
+	"chrome_112_mac":     utls.HelloChrome_100,
 
-	// Firefox mappings -> HelloFirefox_105 (newest Firefox in old utls)
-	"firefox_115": utls.HelloFirefox_105,
-	"firefox_116": utls.HelloFirefox_105,
-	"firefox_117": utls.HelloFirefox_105,
-	"firefox_118": utls.HelloFirefox_105,
-	"firefox_119": utls.HelloFirefox_105,
-	"firefox_121": utls.HelloFirefox_105,
+	// Firefox versions → HelloFirefox_99 (latest Firefox in utls v1.5.0)
+	"firefox_115": utls.HelloFirefox_99,
+	"firefox_116": utls.HelloFirefox_99,
+	"firefox_117": utls.HelloFirefox_99,
+	"firefox_118": utls.HelloFirefox_99,
+	"firefox_119": utls.HelloFirefox_99,
+	"firefox_121": utls.HelloFirefox_99,
 
-	// Safari mappings -> HelloSafari_14
+	// Safari versions → HelloSafari_14
 	"safari_15_5": utls.HelloSafari_14,
 	"safari_16_0": utls.HelloSafari_14,
 	"safari_16_1": utls.HelloSafari_14,
@@ -119,7 +121,7 @@ func main() {
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
-	fpID := "chrome_120"  // default
+	fpID := "chrome_120" // default
 	var upstreamURL string
 	if auth := r.Header.Get("Proxy-Authorization"); auth != "" {
 		upstreamURL, fpID = parseBasicAuth(auth)
@@ -127,7 +129,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	helloID, ok := fingerprintMap[fpID]
 	if !ok {
-		helloID = utls.HelloChrome_106
+		helloID = utls.HelloChrome_100
 	}
 	log.Printf("CONNECT %s with fingerprint %s, upstream=%s", r.URL.Host, fpID, upstreamURL)
 
