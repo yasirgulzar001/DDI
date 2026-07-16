@@ -17,6 +17,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
