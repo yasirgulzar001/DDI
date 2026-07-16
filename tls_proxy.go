@@ -1,7 +1,5 @@
-// tls_proxy.go – TLS fingerprint rotation proxy using refraction-networking/utls
+// tls_proxy.go – TLS fingerprint rotation proxy (works with utls v1.4.x+)
 // Build:
-//   go mod init tlsproxy
-//   go get github.com/refraction-networking/utls@latest
 //   go build -o tls_proxy tls_proxy.go
 
 package main
@@ -21,42 +19,35 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-var (
-	listenAddr = flag.String("listen", "127.0.0.1:8080", "Address to listen on")
-	ja3TestURL = flag.String("ja3-test", "https://ja3er.com/json", "JA3 test URL")
-)
+var listenAddr = flag.String("listen", "127.0.0.1:8080", "Address to listen on")
 
-// All fingerprints are guaranteed to exist in utls v1.6.7+
+// Fingerprint map using constants that exist in utls v1.4.x (no Chrome_108 etc.)
 var fingerprintMap = map[string]utls.ClientHelloID{
-	"chrome_108":         utls.HelloChrome_108,
-	"chrome_109":         utls.HelloChrome_109,
-	"chrome_110":         utls.HelloChrome_110,
-	"chrome_111":         utls.HelloChrome_111,
-	"chrome_112":         utls.HelloChrome_112,
-	"chrome_114":         utls.HelloChrome_114,
-	"chrome_116":         utls.HelloChrome_116,
-	"chrome_117":         utls.HelloChrome_117,
-	"chrome_120":         utls.HelloChrome_120,
-	"chrome_123":         utls.HelloChrome_123,
-	"chrome_124":         utls.HelloChrome_124,
-	"firefox_115":        utls.HelloFirefox_115,
-	"firefox_116":        utls.HelloFirefox_116,
-	"firefox_117":        utls.HelloFirefox_117,
-	"firefox_118":        utls.HelloFirefox_118,
-	"firefox_119":        utls.HelloFirefox_119,
-	"firefox_121":        utls.HelloFirefox_121,
-	"firefox_127":        utls.HelloFirefox_127,
-	"safari_15_5":        utls.HelloSafari_15_5,
-	"safari_15_6":        utls.HelloSafari_15_6,
-	"safari_16_0":        utls.HelloSafari_16_0,
-	"safari_16_1":        utls.HelloSafari_16_1,
-	"safari_17_0":        utls.HelloSafari_17_0,
-	"safari_18_0":        utls.HelloSafari_18_0,
-	"ios_14":             utls.HelloIOS_14,
-	"ios_15":             utls.HelloIOS_15,
-	"ios_16":             utls.HelloIOS_16,
-	"android_11":         utls.HelloAndroid_11,
-	"edge_106":           utls.HelloEdge_106,
+	// Chrome mappings -> HelloChrome_106 (the newest available in old utls)
+	"chrome_108":         utls.HelloChrome_106,
+	"chrome_109":         utls.HelloChrome_106,
+	"chrome_110":         utls.HelloChrome_106,
+	"chrome_111":         utls.HelloChrome_106,
+	"chrome_112":         utls.HelloChrome_106,
+	"chrome_114":         utls.HelloChrome_106,
+	"chrome_120":         utls.HelloChrome_106,
+	"chrome_123":         utls.HelloChrome_106,
+	"chrome_112_windows": utls.HelloChrome_106,
+	"chrome_112_mac":     utls.HelloChrome_106,
+
+	// Firefox mappings -> HelloFirefox_105 (newest Firefox in old utls)
+	"firefox_115": utls.HelloFirefox_105,
+	"firefox_116": utls.HelloFirefox_105,
+	"firefox_117": utls.HelloFirefox_105,
+	"firefox_118": utls.HelloFirefox_105,
+	"firefox_119": utls.HelloFirefox_105,
+	"firefox_121": utls.HelloFirefox_105,
+
+	// Safari mappings -> HelloSafari_14
+	"safari_15_5": utls.HelloSafari_14,
+	"safari_16_0": utls.HelloSafari_14,
+	"safari_16_1": utls.HelloSafari_14,
+	"safari_17_0": utls.HelloSafari_14,
 }
 
 func parseBasicAuth(authHeader string) (username, password string) {
@@ -69,7 +60,6 @@ func parseBasicAuth(authHeader string) (username, password string) {
 	if len(pair) != 2 {
 		return
 	}
-	// Use PathUnescape for URL‑encoded upstream, not QueryUnescape (which mangles '+')
 	decoded, err := url.PathUnescape(pair[0])
 	if err != nil {
 		decoded = pair[0]
@@ -129,7 +119,7 @@ func main() {
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
-	fpID := "chrome_120"
+	fpID := "chrome_120"  // default
 	var upstreamURL string
 	if auth := r.Header.Get("Proxy-Authorization"); auth != "" {
 		upstreamURL, fpID = parseBasicAuth(auth)
@@ -137,7 +127,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	helloID, ok := fingerprintMap[fpID]
 	if !ok {
-		helloID = utls.HelloChrome_120
+		helloID = utls.HelloChrome_106
 	}
 	log.Printf("CONNECT %s with fingerprint %s, upstream=%s", r.URL.Host, fpID, upstreamURL)
 
