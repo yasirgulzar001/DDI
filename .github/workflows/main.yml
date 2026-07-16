@@ -1,51 +1,61 @@
 name: Run Telegram Bot
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
-bot:
-runs-on: ubuntu-latest
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+    steps:
+      # 1. Repository checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  - name: Setup Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.11"
+      # 2. Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-  - name: Setup Go
-    uses: actions/setup-go@v5
-    with:
-      go-version: "1.23"
+      # 3. Setup Go
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
 
-  - name: Install Python packages
-    run: |
-      python -m pip install --upgrade pip
-      pip install -r requirements.txt
+      # 4. Install Python dependencies
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-  - name: Install Playwright
-    run: |
-      python -m playwright install --with-deps chromium
+      # 5. Install Playwright Chromium
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install --with-deps chromium
 
-  - name: Prepare Go module
-    run: |
-      go mod init tls_proxy || true
-      go get github.com/refraction-networking/utls
-      go mod tidy
+      # 6. Create Go module and install uTLS
+      - name: Setup Go module
+        run: |
+          go mod init tls_proxy
+          go get github.com/refraction-networking/utls
+          go mod tidy
 
-  - name: Build TLS Proxy
-    run: |
-      go build -o tls_proxy tls_proxy.go
-      chmod +x tls_proxy
+      # 7. Build TLS proxy
+      - name: Build TLS proxy
+        run: |
+          go build -o tls_proxy tls_proxy.go
+          chmod +x tls_proxy
 
-  - name: Check files
-    run: |
-      ls -la
-      ./tls_proxy --help || true
+      # 8. Verify TLS proxy exists
+      - name: Verify TLS proxy
+        run: |
+          ls -lh tls_proxy
+          file tls_proxy
 
-  - name: Run Telegram Bot
-    run: |
-      python YTmax.py
+      # 9. Run Telegram bot
+      - name: Run Telegram Bot
+        run: |
+          python YTmax.py
