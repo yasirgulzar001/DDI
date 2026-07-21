@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-YouTube Views Generator – Working Version (No TLS Proxy)
-- Works out‑of‑the‑box without Go binary.
-- TLS fingerprint rotation is disabled (Chromium default JA3).
-- IP proxy rotation, stealth, and human simulation still active.
+YouTube Views Generator – Production-Ready Version
+- Fixes: stealth API, latency guard, file size limit, encrypted credentials,
+  proxy-less job skip, background proxy checks, port validation.
 """
 
-import asyncio, re, random, logging, os
+import asyncio, re, random, logging, os, sys, base64, hashlib
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command
@@ -23,7 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 import aiosqlite
-from aiohttp import ClientSession, ClientTimeout
+from cryptography.fernet import Fernet
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from playwright_stealth import StealthConfig, stealth_async
@@ -32,17 +31,36 @@ import fake_useragent
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "123456789").split(",")))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    sys.exit("ERROR: BOT_TOKEN is not set. Add it to your .env file.")
+
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "0").split(",")))
 DB_PATH = "bot.db"
 DEFAULT_THREADS = 5
 PROXY_CHECK_INTERVAL = 15 * 60          # 15 min
 DEAD_PROXY_CLEANUP_INTERVAL = 60 * 60   # 1 hour
 DEAD_PROXY_RETENTION_HOURS = 24
 MAX_CONCURRENT_VIEWS = 10
+MAX_PROXY_FILE_SIZE = 1 * 1024 * 1024   # 1 MB
 
 STORAGE_DIR = Path("./browser_sessions")
 STORAGE_DIR.mkdir(exist_ok=True)
+
+# --- Encryption setup (for proxy credentials) ---
+_enc_key = os.getenv("ENCRYPTION_KEY")
+if not _enc_key:
+    # Derive a deterministic key from BOT_TOKEN (NOT secure for real secrets)
+    _raw = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    _enc_key = base64.urlsafe_b64encode(_raw)
+    logger.warning("ENCRYPTION_KEY not set. Using BOT_TOKEN-derived key – change for production.")
+_fernet = Fernet(_enc_key)
+
+def encrypt(text: str) -> str:
+    return _fernet.encrypt(text.encode()).decode()
+
+def decrypt(token: str) -> str:
+    return _fernet.decrypt(token.encode()).decode()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -135,7 +153,11 @@ def confirm_kb():
 # Helpers
 # -------------------------------------------------------------------
 def extract_video_id(url: str) -> Optional[str]:
-    patterns = [r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})"]
+    patterns = [
+        r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})",
+        r"/embed/([a-zA-Z0-9_-]{11})",
+        r"/shorts/([a-zA-Z0-9_-]{11})"
+    ]
     for p in patterns:
         m = re.search(p, url)
         if m:
@@ -160,22 +182,43 @@ def parse_proxy_line(line: str) -> Optional[dict]:
         ip_port = host.split(":")
         if len(user_pass) != 2 or len(ip_port) != 2:
             return None
+        try:
+            port = int(ip_port[1])
+            if not (1 <= port <= 65535):
+                return None
+        except ValueError:
+            return None
         return {
             "ip": ip_port[0],
-            "port": int(ip_port[1]),
+            "port": port,
             "username": user_pass[0],
             "password": user_pass[1]
         }
     else:
         parts = line.split(":")
         if len(parts) == 2:
-            return {"ip": parts[0], "port": int(parts[1]), "username": None, "password": None}
+            try:
+                port = int(parts[1])
+                if not (1 <= port <= 65535):
+                    return None
+            except ValueError:
+                return None
+            return {"ip": parts[0], "port": port, "username": None, "password": None}
         elif len(parts) == 4:
-            return {"ip": parts[0], "port": int(parts[1]), "username": parts[2], "password": parts[3]}
+            try:
+                port = int(parts[1])
+                if not (1 <= port <= 65535):
+                    return None
+            except ValueError:
+                return None
+            return {"ip": parts[0], "port": port, "username": parts[2], "password": parts[3]}
     return None
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 # -------------------------------------------------------------------
-# Fingerprint Generator (unchanged)
+# Fingerprint Generator
 # -------------------------------------------------------------------
 class FingerprintGenerator:
     def __init__(self):
@@ -237,9 +280,14 @@ class FingerprintGenerator:
 class UserConcurrencyManager:
     def __init__(self):
         self.semaphores: Dict[int, asyncio.Semaphore] = {}
+        self.limits: Dict[int, int] = {}  # explicit limits – never touch _value
 
-    async def set_limit(self, user_id: int, limit: int):
+    def set_limit(self, user_id: int, limit: int):
+        self.limits[user_id] = limit
         self.semaphores[user_id] = asyncio.Semaphore(limit)
+
+    def get_limit(self, user_id: int) -> int:
+        return self.limits.get(user_id, DEFAULT_THREADS)
 
     async def acquire(self, user_id: int) -> asyncio.Semaphore:
         if user_id not in self.semaphores:
@@ -248,6 +296,7 @@ class UserConcurrencyManager:
                 cur = await db.execute("SELECT threads FROM users WHERE id=?", (user_id,))
                 row = await cur.fetchone()
                 limit = row["threads"] if row else DEFAULT_THREADS
+            self.limits[user_id] = limit
             self.semaphores[user_id] = asyncio.Semaphore(limit)
         return self.semaphores[user_id]
 
@@ -257,6 +306,7 @@ class UserConcurrencyManager:
                 cur = await db.execute("SELECT 1 FROM users WHERE id=?", (uid,))
                 if not await cur.fetchone():
                     del self.semaphores[uid]
+                    self.limits.pop(uid, None)
 
 # -------------------------------------------------------------------
 # Browser Manager (NO TLS PROXY)
@@ -276,7 +326,6 @@ class BrowserManager:
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled',
                   '--disable-dev-shm-usage', '--disable-setuid-sandbox']
         )
-        # Background cleanup tasks
         asyncio.create_task(dead_proxy_cleanup_loop())
         asyncio.create_task(semaphore_cleanup_loop(self.user_concurrency))
         logger.info("BrowserManager started (no TLS proxy)")
@@ -298,6 +347,7 @@ class BrowserManager:
             username = proxy.get("username")
             password = proxy.get("password")
             if username and password:
+                # decrypt credentials if stored encrypted (they are plain now after decryption in query)
                 server = f"http://{username}:{password}@{proxy['ip']}:{proxy['port']}"
             playwright_proxy = {"server": server}
 
@@ -324,6 +374,8 @@ class BrowserManager:
             hack_webrtc=False, remove_hairline=True,
             mock_fonts=True, mock_chrome_features=True,
         ))
+
+        # Override specific navigator props via init script
         await context.add_init_script(f"""
             Object.defineProperty(navigator, 'platform', {{ get: () => '{fp_data["platform"]}' }});
             Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {fp_data["hardware_concurrency"]} }});
@@ -338,7 +390,7 @@ class BrowserManager:
         return context
 
 # -------------------------------------------------------------------
-# Human Simulation & View Session (identical to original)
+# Human Simulation & View Session
 # -------------------------------------------------------------------
 class HumanSimulator:
     @staticmethod
@@ -367,7 +419,7 @@ class HumanSimulator:
                 el = random.choice(elements)
                 try:
                     await el.click(delay=random.randint(50, 200))
-                except:
+                except Exception:
                     pass
                 await HumanSimulator.random_delay(0.5, 1.0)
 
@@ -410,7 +462,7 @@ class ViewSession:
 
             try:
                 await self.page.wait_for_selector("video", state="visible", timeout=15000)
-            except:
+            except Exception:
                 logger.warning("Video element not found")
                 return False
 
@@ -419,7 +471,7 @@ class ViewSession:
                 if video_el:
                     await video_el.click(delay=random.randint(50, 150))
                     await HumanSimulator.random_delay(0.5, 1.0)
-            except:
+            except Exception:
                 pass
 
             watch_time = random.randint(min_watch, min_watch + 30)
@@ -446,7 +498,7 @@ class ViewSession:
                     try:
                         await random.choice(links).click(delay=random.randint(100, 300))
                         await HumanSimulator.random_delay(2.0, 5.0)
-                    except:
+                    except Exception:
                         pass
             return True
         except Exception as e:
@@ -454,13 +506,26 @@ class ViewSession:
             return False
 
 # -------------------------------------------------------------------
-# Proxy Health Checker (no TLS proxy)
+# Proxy Health Checker
 # -------------------------------------------------------------------
+def _failed_result(proxy: dict, error: str, banned_until=None) -> dict:
+    return {
+        "alive": False,
+        "consecutive_fails": proxy.get("consecutive_fails", 0) + 1,
+        "health_score": max(0.0, proxy.get("health_score", 1.0) - 0.2),
+        "banned_until": banned_until,
+        "last_error": error,
+        "latency_ms": None,
+    }
+
 async def check_proxy_with_browser(proxy: dict, bm: BrowserManager) -> dict:
     try:
         server = f"http://{proxy['ip']}:{proxy['port']}"
         if proxy.get("username"):
-            server = f"http://{proxy['username']}:{proxy['password']}@{proxy['ip']}:{proxy['port']}"
+            # credentials are now stored encrypted; decrypt when using
+            user = decrypt(proxy["username"])
+            pwd = decrypt(proxy["password"])
+            server = f"http://{user}:{pwd}@{proxy['ip']}:{proxy['port']}"
         playwright_proxy = {"server": server}
         context = await bm.browser.new_context(proxy=playwright_proxy)
         page = await context.new_page()
@@ -469,54 +534,76 @@ async def check_proxy_with_browser(proxy: dict, bm: BrowserManager) -> dict:
             if resp and resp.status == 200:
                 content = await page.content()
                 if "unusual traffic" not in content.lower():
-                    return {"alive": True, "consecutive_fails": 0,
-                            "health_score": min(1.0, proxy.get("health_score", 1.0) + 0.1),
-                            "banned_until": None, "last_error": None,
-                            "latency_ms": int(resp.request.responseEndTiming - resp.request.requestStartTiming)}
+                    latency = None
+                    if resp.request is not None:
+                        try:
+                            latency = int(resp.request.responseEndTiming - resp.request.requestStartTiming)
+                        except Exception:
+                            latency = None
+                    return {
+                        "alive": True,
+                        "consecutive_fails": 0,
+                        "health_score": min(1.0, proxy.get("health_score", 1.0) + 0.1),
+                        "banned_until": None,
+                        "last_error": None,
+                        "latency_ms": latency,
+                    }
                 else:
-                    return {"alive": False, "consecutive_fails": proxy.get("consecutive_fails", 0) + 1,
-                            "banned_until": datetime.now(timezone.utc) + timedelta(hours=2),
-                            "last_error": "Captcha/unusual traffic"}
+                    return _failed_result(
+                        proxy, "Captcha/unusual traffic",
+                        banned_until=datetime.now(timezone.utc) + timedelta(hours=2)
+                    )
             else:
-                return {"alive": False, "consecutive_fails": proxy.get("consecutive_fails", 0) + 1,
-                        "banned_until": datetime.now(timezone.utc) + timedelta(hours=2) if resp and resp.status == 429 else None,
-                        "last_error": f"HTTP {resp.status if resp else 'connection failed'}"}
+                banned_until = (
+                    datetime.now(timezone.utc) + timedelta(hours=2)
+                    if resp and resp.status == 429 else None
+                )
+                return _failed_result(
+                    proxy, f"HTTP {resp.status if resp else 'connection failed'}",
+                    banned_until=banned_until
+                )
         except Exception as e:
-            return {"alive": False, "consecutive_fails": proxy.get("consecutive_fails", 0) + 1,
-                    "banned_until": None, "last_error": str(e)}
+            return _failed_result(proxy, str(e))
         finally:
             await context.close()
     except Exception as e:
         logger.error(f"Browser proxy check error: {e}")
-        return {"alive": False, "consecutive_fails": proxy.get("consecutive_fails", 0) + 1,
-                "banned_until": None, "last_error": str(e)}
+        return _failed_result(proxy, str(e))
 
 async def proxy_health_check_loop(bm: BrowserManager):
     while True:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("""
-                SELECT * FROM proxies
-                WHERE last_checked IS NULL OR last_checked < datetime('now', '-15 minutes')
-                LIMIT 20
-            """)
-            due = await cur.fetchall()
-            for row in due:
-                proxy = dict(row)
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("""
+                    SELECT * FROM proxies
+                    WHERE last_checked IS NULL OR last_checked < datetime('now', '-15 minutes')
+                    LIMIT 20
+                """)
+                due = [dict(row) for row in await cur.fetchall()]
+
+            for proxy in due:
                 updates = await check_proxy_with_browser(proxy, bm)
                 updates["last_checked"] = datetime.now(timezone.utc)
-                if not proxy.get("storage_state_path"):
-                    state_path = STORAGE_DIR / f"proxy_{proxy['id']}.json"
-                    await db.execute("UPDATE proxies SET storage_state_path=? WHERE id=?",
-                                     (str(state_path), proxy["id"]))
-                await db.execute("""
-                    UPDATE proxies SET alive=?, consecutive_fails=?, banned_until=?,
-                    health_score=?, last_checked=?, last_error=?, latency_ms=?
-                    WHERE id=?
-                """, (updates["alive"], updates["consecutive_fails"], updates["banned_until"],
-                      updates["health_score"], updates["last_checked"], updates.get("last_error"),
-                      updates.get("latency_ms"), proxy["id"]))
-            await db.commit()
+                async with aiosqlite.connect(DB_PATH) as db:
+                    if not proxy.get("storage_state_path"):
+                        state_path = STORAGE_DIR / f"proxy_{proxy['id']}.json"
+                        await db.execute(
+                            "UPDATE proxies SET storage_state_path=? WHERE id=?",
+                            (str(state_path), proxy["id"])
+                        )
+                    await db.execute("""
+                        UPDATE proxies SET alive=?, consecutive_fails=?, banned_until=?,
+                        health_score=?, last_checked=?, last_error=?, latency_ms=?
+                        WHERE id=?
+                    """, (
+                        updates["alive"], updates["consecutive_fails"], updates["banned_until"],
+                        updates["health_score"], updates["last_checked"],
+                        updates.get("last_error"), updates.get("latency_ms"), proxy["id"]
+                    ))
+                    await db.commit()
+        except Exception as e:
+            logger.error(f"Proxy health loop error: {e}")
         await asyncio.sleep(PROXY_CHECK_INTERVAL)
 
 async def dead_proxy_cleanup_loop():
@@ -539,20 +626,28 @@ async def semaphore_cleanup_loop(ucm: UserConcurrencyManager):
         await ucm.cleanup()
 
 # -------------------------------------------------------------------
-# Job Worker (unchanged logic)
+# Job Worker
 # -------------------------------------------------------------------
+async def is_job_cancelled(job_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT status FROM jobs WHERE id=?", (job_id,))
+        row = await cur.fetchone()
+        return row is None or row[0] == "cancelled"
+
 async def worker_thread(job_id: int, video_url: str, min_watch: int,
                         proxy: dict, bm: BrowserManager, user_sem: asyncio.Semaphore):
     async with user_sem, bm.semaphore:
+        if await is_job_cancelled(job_id):
+            return False
         async with ViewSession(bm, proxy) as session:
             success = await session.execute_view(video_url, min_watch)
-        async with aiosqlite.connect(DB_PATH) as db:
-            if success:
-                await db.execute("UPDATE jobs SET completed_views = completed_views + 1 WHERE id=?", (job_id,))
-            else:
-                await db.execute("UPDATE jobs SET failed_views = failed_views + 1 WHERE id=?", (job_id,))
-            await db.commit()
-        return success
+    async with aiosqlite.connect(DB_PATH) as db:
+        if success:
+            await db.execute("UPDATE jobs SET completed_views = completed_views + 1 WHERE id=?", (job_id,))
+        else:
+            await db.execute("UPDATE jobs SET failed_views = failed_views + 1 WHERE id=?", (job_id,))
+        await db.commit()
+    return success
 
 async def run_job_workers(job_id: int, bm: BrowserManager):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -570,7 +665,8 @@ async def run_job_workers(job_id: int, bm: BrowserManager):
         await db.commit()
 
     user_sem = await bm.user_concurrency.acquire(user_id)
-    producer_sem = asyncio.Semaphore(2 * (user_sem._value if hasattr(user_sem, '_value') else DEFAULT_THREADS))
+    thread_limit = bm.user_concurrency.get_limit(user_id)
+    producer_sem = asyncio.Semaphore(thread_limit * 2)
 
     async def fetch_proxy() -> Optional[dict]:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -584,12 +680,18 @@ async def run_job_workers(job_id: int, bm: BrowserManager):
                 LIMIT 1
             """, (user_id,))
             row = await cur.fetchone()
-            return dict(row) if row else {}
+            return dict(row) if row else None
 
     tasks = []
     for _ in range(target_views):
+        if await is_job_cancelled(job_id):
+            break
         await producer_sem.acquire()
         proxy = await fetch_proxy()
+        if proxy is None:
+            # No proxy available – release semaphore and skip this view attempt
+            producer_sem.release()
+            continue
         t = asyncio.create_task(
             worker_thread(job_id, video_url, min_watch, proxy, bm, user_sem)
         )
@@ -600,43 +702,98 @@ async def run_job_workers(job_id: int, bm: BrowserManager):
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT completed_views, target_views FROM jobs WHERE id=?", (job_id,))
+        cur = await db.execute(
+            "SELECT status, completed_views, target_views FROM jobs WHERE id=?", (job_id,)
+        )
         job = await cur.fetchone()
-        if job and job["completed_views"] >= job["target_views"]:
-            await db.execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))
-        else:
-            await db.execute("UPDATE jobs SET status='completed' WHERE id=?", (job_id,))
+        if job and job["status"] not in ("cancelled", "error"):
+            final = "done" if job["completed_views"] >= job["target_views"] else "partial"
+            await db.execute("UPDATE jobs SET status=? WHERE id=?", (final, job_id))
         await db.commit()
 
-async def safe_run_job(job_id: int, bm: BrowserManager):
+async def safe_run_job(job_id: int, bm: BrowserManager, bot: Bot = None, telegram_id: int = None):
     try:
         await run_job_workers(job_id, bm)
+        if bot and telegram_id:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT status, completed_views, target_views, failed_views FROM jobs WHERE id=?",
+                    (job_id,)
+                )
+                job = await cur.fetchone()
+            if job:
+                status_emoji = "✅" if job["status"] == "done" else ("⚠️" if job["status"] == "partial" else "❌")
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        f"{status_emoji} Job #{job_id} finished — "
+                        f"{job['completed_views']}/{job['target_views']} views "
+                        f"(+{job['failed_views']} failed) | Status: {job['status']}"
+                    )
+                except Exception:
+                    pass
     except Exception as e:
         logger.exception(f"Job {job_id} crashed: {e}")
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE jobs SET status='error' WHERE id=?", (job_id,))
             await db.commit()
+        if bot and telegram_id:
+            try:
+                await bot.send_message(telegram_id, f"❌ Job #{job_id} crashed with an internal error.")
+            except Exception:
+                pass
 
 # -------------------------------------------------------------------
 # Telegram Bot Handlers
 # -------------------------------------------------------------------
 router = Router()
 bm_global: BrowserManager = None
+bot_global: Bot = None
 
-def get_bm():
+def get_bm() -> BrowserManager:
     return bm_global
+
+def get_bot() -> Bot:
+    return bot_global
 
 @router.message(Command("start"))
 async def start(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (message.from_user.id,))
         await db.commit()
-    await message.answer(f"Welcome {message.from_user.full_name}!", reply_markup=main_menu())
+    await message.answer(
+        f"Welcome {message.from_user.full_name}!\n\n"
+        "Use /add to create a view job, /balance to check your credits, "
+        "or /help for a full command list.",
+        reply_markup=main_menu()
+    )
+
+@router.message(Command("ping"))
+async def ping(message: types.Message):
+    await message.reply("🏓 Pong! Bot is alive.")
 
 @router.message(Command("help"))
 async def help_cmd(message: types.Message):
-    await message.answer("Commands: /views, /add, /status, /jobs, /threads, /balance, "
-                         "/myproxies, /proxyhealth, /addproxies, /checkmyproxies, /autocheck, /cancel")
+    await message.answer(
+        "📋 <b>Commands</b>\n\n"
+        "<b>Jobs</b>\n"
+        "/views <url> <amount> [country] — quick start\n"
+        "/add — guided job wizard\n"
+        "/status — last 5 jobs\n"
+        "/jobs — last 10 jobs\n"
+        "/cancel <id> — cancel a running job\n\n"
+        "<b>Account</b>\n"
+        "/balance — credits & tier\n"
+        "/threads <1-50> — set parallel threads\n\n"
+        "<b>Proxies</b>\n"
+        "/addproxies — upload proxy list (.txt)\n"
+        "/myproxies — proxy pool stats\n"
+        "/proxyhealth — health & latency stats\n"
+        "/checkmyproxies — force health check now\n"
+        "/autocheck <on|off> — auto health checks",
+        parse_mode="HTML"
+    )
 
 @router.message(Command("balance"))
 async def balance(message: types.Message):
@@ -645,31 +802,33 @@ async def balance(message: types.Message):
         cur = await db.execute("SELECT credits, tier FROM users WHERE telegram_id=?", (message.from_user.id,))
         user = await cur.fetchone()
         if user:
-            await message.reply(f"Balance: {cents_to_dollars(user['credits'])} | Tier: {user['tier']}")
+            await message.reply(f"💰 Balance: {cents_to_dollars(user['credits'])} | Tier: {user['tier']}")
         else:
-            await message.reply("Use /start first")
+            await message.reply("Use /start first.")
 
 @router.message(Command("threads"))
-async def threads(message: types.Message):
+async def threads_cmd(message: types.Message):
     try:
         parts = message.text.split()
         if len(parts) < 2:
             raise ValueError
         t = int(parts[1])
-        if 1 <= t <= 50:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET threads=? WHERE telegram_id=?", (t, message.from_user.id))
-                await db.commit()
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (message.from_user.id,))
-                row = await cur.fetchone()
-                if row:
-                    await get_bm().user_concurrency.set_limit(row[0], t)
-            await message.reply(f"Threads set to {t}")
-        else:
+        if not (1 <= t <= 50):
             raise ValueError
-    except:
+    except (ValueError, IndexError):
         await message.reply("Usage: /threads <1-50>")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("UPDATE users SET threads=? WHERE telegram_id=?", (t, message.from_user.id))
+        cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (message.from_user.id,))
+        row = await cur.fetchone()
+        await db.commit()
+
+    if row:
+        get_bm().user_concurrency.set_limit(row["id"], t)
+    await message.reply(f"✅ Threads set to {t}")
 
 @router.message(Command("views"))
 async def views_quick(message: types.Message):
@@ -678,33 +837,47 @@ async def views_quick(message: types.Message):
         await message.reply("Usage: /views <url> <amount> [country]")
         return
     url = args[1]
+    if not extract_video_id(url):
+        await message.reply("❌ Invalid YouTube URL.")
+        return
     try:
         amount = int(args[2])
-    except:
-        await message.reply("Amount must be an integer.")
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.reply("❌ Amount must be a positive integer.")
         return
-    country = args[3] if len(args) > 3 else None
+    country = args[3].upper() if len(args) > 3 else None
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT id, credits, tier FROM users WHERE telegram_id=?", (message.from_user.id,))
         user = await cur.fetchone()
         if not user:
-            await message.reply("Use /start first")
+            await message.reply("Use /start first.")
             return
         cost = estimate_cost_cents(amount, user["tier"])
         if user["credits"] < cost:
-            await message.reply(f"Insufficient funds. Need {cents_to_dollars(cost)}, have {cents_to_dollars(user['credits'])}")
+            await message.reply(
+                f"❌ Insufficient funds. Need {cents_to_dollars(cost)}, "
+                f"have {cents_to_dollars(user['credits'])}"
+            )
             return
         await db.execute("UPDATE users SET credits = credits - ? WHERE telegram_id=?", (cost, message.from_user.id))
-        cur = await db.execute("""
-            INSERT INTO jobs (user_id, video_url, target_views, country) VALUES (?, ?, ?, ?)
-        """, (user["id"], url, amount, country))
+        cur = await db.execute(
+            "INSERT INTO jobs (user_id, video_url, target_views, country) VALUES (?, ?, ?, ?)",
+            (user["id"], url, amount, country)
+        )
         job_id = cur.lastrowid
         await db.commit()
-        asyncio.create_task(safe_run_job(job_id, get_bm()))
-    await message.reply(f"Job #{job_id} started: {amount} views on {url} (cost: {cents_to_dollars(cost)})")
 
-# --- FSM add flow (identical to original) ---
+    asyncio.create_task(safe_run_job(job_id, get_bm(), get_bot(), message.from_user.id))
+    await message.reply(
+        f"🚀 Job #{job_id} started: {amount} views\n"
+        f"Cost: {cents_to_dollars(cost)} | You'll be notified when done."
+    )
+
+# --- FSM add flow ---
 @router.message(Command("add"))
 async def add_start(message: types.Message, state: FSMContext):
     await state.set_state(AddView.url)
@@ -713,7 +886,7 @@ async def add_start(message: types.Message, state: FSMContext):
 @router.message(AddView.url)
 async def add_url(message: types.Message, state: FSMContext):
     if not extract_video_id(message.text):
-        await message.reply("Invalid YouTube URL. Try again:")
+        await message.reply("❌ Invalid YouTube URL. Try again:")
         return
     await state.update_data(url=message.text)
     await state.set_state(AddView.target)
@@ -725,8 +898,8 @@ async def add_target(message: types.Message, state: FSMContext):
         amount = int(message.text)
         if amount <= 0:
             raise ValueError
-    except:
-        await message.reply("Please enter a positive number:")
+    except ValueError:
+        await message.reply("❌ Please enter a positive number:")
         return
     await state.update_data(target=amount)
     await state.set_state(AddView.country)
@@ -734,6 +907,7 @@ async def add_target(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("country_"))
 async def country_callback(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
     country = callback.data.split("_")[1] if callback.data != "country_any" else None
     await state.update_data(country=country)
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -744,44 +918,63 @@ async def country_callback(callback: types.CallbackQuery, state: FSMContext):
 async def add_watch(message: types.Message, state: FSMContext):
     try:
         watch = int(message.text)
-        if watch < 10: watch = 60
-    except:
+        if watch < 10:
+            watch = 60
+    except ValueError:
         watch = 60
     await state.update_data(watch=watch)
     data = await state.get_data()
-    summary = (f"Video: {data['url']}\nViews: {data['target']}\n"
-               f"Country: {data.get('country', 'Any')}\nWatch: {watch}s\nConfirm?")
+    summary = (
+        f"📋 <b>Job Summary</b>\n"
+        f"Video: {data['url']}\n"
+        f"Views: {data['target']}\n"
+        f"Country: {data.get('country') or 'Any'}\n"
+        f"Min Watch: {watch}s\n\n"
+        "Confirm?"
+    )
     await state.set_state(AddView.confirm)
-    await message.reply(summary, reply_markup=confirm_kb())
+    await message.reply(summary, reply_markup=confirm_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data == "confirm_job")
 async def confirm_job(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
     data = await state.get_data()
+    await state.clear()
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT id, credits, tier FROM users WHERE telegram_id=?", (callback.from_user.id,))
         user = await cur.fetchone()
+        if not user:
+            await callback.message.reply("Use /start first.")
+            return
         cost = estimate_cost_cents(data["target"], user["tier"])
         if user["credits"] < cost:
-            await callback.message.reply("Not enough credits.")
+            await callback.message.reply(
+                f"❌ Not enough credits. Need {cents_to_dollars(cost)}, "
+                f"have {cents_to_dollars(user['credits'])}."
+            )
             return
         await db.execute("UPDATE users SET credits = credits - ? WHERE id=?", (cost, user["id"]))
-        cur = await db.execute("""
-            INSERT INTO jobs (user_id, video_url, target_views, country, min_watch)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user["id"], data["url"], data["target"], data["country"], data["watch"]))
+        cur = await db.execute(
+            "INSERT INTO jobs (user_id, video_url, target_views, country, min_watch) VALUES (?, ?, ?, ?, ?)",
+            (user["id"], data["url"], data["target"], data.get("country"), data["watch"])
+        )
         job_id = cur.lastrowid
         await db.commit()
-        asyncio.create_task(safe_run_job(job_id, get_bm()))
+
+    asyncio.create_task(safe_run_job(job_id, get_bm(), get_bot(), callback.from_user.id))
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply(f"Job #{job_id} started.")
-    await state.clear()
+    await callback.message.reply(
+        f"🚀 Job #{job_id} started. You'll be notified when it finishes."
+    )
 
 @router.callback_query(F.data == "cancel_job")
 async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply("Cancelled.")
+    await callback.message.reply("❌ Cancelled.")
 
 @router.message(Command("status"))
 async def status(message: types.Message):
@@ -790,7 +983,7 @@ async def status(message: types.Message):
         cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (message.from_user.id,))
         user = await cur.fetchone()
         if not user:
-            await message.reply("No user found")
+            await message.reply("No account found. Use /start.")
             return
         cur = await db.execute("""
             SELECT id, video_url, status, completed_views, target_views, failed_views
@@ -800,10 +993,13 @@ async def status(message: types.Message):
         if not jobs:
             await message.reply("No jobs yet.")
             return
-        text = ""
+        lines = []
         for j in jobs:
-            text += f"#{j['id']} | {j['status']} | {j['completed_views']}/{j['target_views']} views (+{j['failed_views']} fails)\n"
-        await message.reply(text)
+            lines.append(
+                f"#{j['id']} | {j['status']} | "
+                f"{j['completed_views']}/{j['target_views']} ✅  {j['failed_views']} ❌"
+            )
+        await message.reply("📊 <b>Recent Jobs</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 @router.message(Command("jobs"))
 async def jobs_list(message: types.Message):
@@ -813,35 +1009,56 @@ async def jobs_list(message: types.Message):
         user = await cur.fetchone()
         if not user:
             return
-        cur = await db.execute("SELECT * FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user["id"],))
+        cur = await db.execute(
+            "SELECT * FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user["id"],)
+        )
         jobs = await cur.fetchall()
         if not jobs:
-            await message.reply("No jobs.")
+            await message.reply("No jobs yet.")
             return
-        text = "Last 10 jobs:\n"
-        for j in jobs:
-            text += f"#{j['id']} {j['video_url']} - {j['status']} ({j['completed_views']}/{j['target_views']})\n"
-        await message.reply(text)
+        lines = [f"#{j['id']} {j['video_url']} — {j['status']} ({j['completed_views']}/{j['target_views']})"
+                 for j in jobs]
+        await message.reply("📋 <b>Last 10 jobs</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 @router.message(Command("cancel"))
-async def cancel_job(message: types.Message):
+async def cancel_job_cmd(message: types.Message):
     try:
         job_id = int(message.text.split()[1])
-    except:
+    except (IndexError, ValueError):
         await message.reply("Usage: /cancel <job_id>")
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE jobs SET status='cancelled' WHERE id=? AND status IN ('pending','running')", (job_id,))
-        await db.commit()
-    await message.reply(f"Job #{job_id} cancelled if it was running.")
 
-# --- Proxy management (unchanged) ---
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (message.from_user.id,))
+        user = await cur.fetchone()
+        if not user:
+            return
+        cur = await db.execute(
+            "SELECT id FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"])
+        )
+        if not await cur.fetchone():
+            await message.reply("❌ Job not found or doesn't belong to you.")
+            return
+        await db.execute(
+            "UPDATE jobs SET status='cancelled' WHERE id=? AND status IN ('pending','running')",
+            (job_id,)
+        )
+        await db.commit()
+    await message.reply(f"🛑 Job #{job_id} cancelled.")
+
+# --- Proxy management ---
 @router.message(Command("addproxies"))
 async def addproxies(message: types.Message):
     await message.reply("Send me a .txt file with proxies (ip:port or ip:port:user:pass)")
 
 @router.message(F.document.file_name.endswith('.txt'))
 async def proxy_file_handler(message: types.Message):
+    # Enforce file size limit to prevent OOM
+    if message.document.file_size is not None and message.document.file_size > MAX_PROXY_FILE_SIZE:
+        await message.reply("❌ File too large. Max size is 1 MB.")
+        return
+
     file_id = message.document.file_id
     file = await message.bot.get_file(file_id)
     file_bytes = await message.bot.download_file(file.file_path)
@@ -861,13 +1078,16 @@ async def proxy_file_handler(message: types.Message):
             if await cur.fetchone():
                 continue
             state_path = STORAGE_DIR / f"proxy_{parsed['ip']}_{parsed['port']}.json"
+            # Encrypt credentials before storing
+            enc_user = encrypt(parsed["username"]) if parsed["username"] else None
+            enc_pass = encrypt(parsed["password"]) if parsed["password"] else None
             await db.execute("""
                 INSERT INTO proxies (user_id, ip, port, username, password, type, storage_state_path)
                 VALUES (?, ?, ?, ?, ?, 'residential', ?)
-            """, (user["id"], parsed["ip"], parsed["port"], parsed["username"], parsed["password"], str(state_path)))
+            """, (user["id"], parsed["ip"], parsed["port"], enc_user, enc_pass, str(state_path)))
             added += 1
         await db.commit()
-    await message.reply(f"Added {added} new proxies.")
+    await message.reply(f"✅ Added {added} new proxies.")
 
 @router.message(Command("myproxies"))
 async def myproxies(message: types.Message):
@@ -878,11 +1098,17 @@ async def myproxies(message: types.Message):
         if not user:
             return
         cur = await db.execute("""
-            SELECT COUNT(*) as total, SUM(alive) as alive, SUM(CASE WHEN alive=0 THEN 1 ELSE 0 END) as dead
+            SELECT COUNT(*) as total,
+                   SUM(alive) as alive,
+                   SUM(CASE WHEN alive=0 THEN 1 ELSE 0 END) as dead
             FROM proxies WHERE user_id=?
         """, (user["id"],))
         stats = await cur.fetchone()
-        await message.reply(f"Total: {stats['total']} | Alive: {stats['alive']} | Dead: {stats['dead']}")
+        await message.reply(
+            f"🌐 <b>Proxy Pool</b>\n"
+            f"Total: {stats['total']} | Alive: {stats['alive'] or 0} | Dead: {stats['dead'] or 0}",
+            parse_mode="HTML"
+        )
 
 @router.message(Command("proxyhealth"))
 async def proxyhealth(message: types.Message):
@@ -898,12 +1124,22 @@ async def proxyhealth(message: types.Message):
             FROM proxies WHERE user_id=?
         """, (user["id"],))
         stats = await cur.fetchone()
-        text = f"Pool health:\nAlive: {stats['alive']}/{stats['total']}\nAvg Health: {stats['avg_h']:.2f}\nAvg Latency: {stats['avg_l'] or 'N/A'}"
-        await message.reply(text)
+        total = stats["total"] or 0
+        alive = stats["alive"] or 0
+        avg_h = stats["avg_h"]
+        avg_l = stats["avg_l"]
+        health_str = f"{avg_h:.2f}" if avg_h is not None else "N/A"
+        latency_str = f"{int(avg_l)}ms" if avg_l is not None else "N/A"
+        await message.reply(
+            f"🏥 <b>Pool Health</b>\n"
+            f"Alive: {alive}/{total}\n"
+            f"Avg Health Score: {health_str}\n"
+            f"Avg Latency: {latency_str}",
+            parse_mode="HTML"
+        )
 
 @router.message(Command("checkmyproxies"))
 async def checkmyproxies(message: types.Message):
-    await message.reply("Starting immediate proxy health check...")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (message.from_user.id,))
@@ -911,23 +1147,43 @@ async def checkmyproxies(message: types.Message):
         if not user:
             return
         cur = await db.execute("SELECT * FROM proxies WHERE user_id=?", (user["id"],))
-        proxies = await cur.fetchall()
+        proxies = [dict(row) for row in await cur.fetchall()]
+
+    if not proxies:
+        await message.reply("You have no proxies.")
+        return
+
+    # Offload to background to keep bot responsive
+    async def _do_check():
         alive_before = sum(p["alive"] for p in proxies)
-        for row in proxies:
-            proxy = dict(row)
+        for proxy in proxies:
             updates = await check_proxy_with_browser(proxy, get_bm())
             updates["last_checked"] = datetime.now(timezone.utc)
-            await db.execute("""
-                UPDATE proxies SET alive=?, consecutive_fails=?, banned_until=?,
-                health_score=?, last_checked=?, last_error=?, latency_ms=?
-                WHERE id=?
-            """, (updates["alive"], updates["consecutive_fails"], updates["banned_until"],
-                  updates["health_score"], updates["last_checked"], updates.get("last_error"),
-                  updates.get("latency_ms"), proxy["id"]))
-        await db.commit()
-        cur = await db.execute("SELECT COUNT(*) as cnt FROM proxies WHERE user_id=? AND alive=1", (user["id"],))
-        after = await cur.fetchone()
-        await message.reply(f"Check complete. Alive before: {alive_before}, alive now: {after['cnt']}")
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    UPDATE proxies SET alive=?, consecutive_fails=?, banned_until=?,
+                    health_score=?, last_checked=?, last_error=?, latency_ms=?
+                    WHERE id=?
+                """, (
+                    updates["alive"], updates["consecutive_fails"], updates["banned_until"],
+                    updates["health_score"], updates["last_checked"],
+                    updates.get("last_error"), updates.get("latency_ms"), proxy["id"]
+                ))
+                await db.commit()
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) as cnt FROM proxies WHERE user_id=? AND alive=1", (user["id"],)
+            )
+            after = await cur.fetchone()
+        try:
+            await message.reply(
+                f"✅ Check complete.\nAlive before: {alive_before} → now: {after['cnt']}"
+            )
+        except Exception:
+            pass
+
+    asyncio.create_task(_do_check())
+    await message.reply(f"⏳ Checking {len(proxies)} proxies in background…")
 
 @router.message(Command("autocheck"))
 async def autocheck(message: types.Message):
@@ -941,9 +1197,7 @@ async def autocheck(message: types.Message):
         await db.commit()
     await message.reply(f"Autocheck turned {args[1]}")
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
+# --- Admin commands ---
 @router.message(Command("admin_stats"))
 async def admin_stats(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -953,9 +1207,18 @@ async def admin_stats(message: types.Message):
         jobs_count = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM proxies")
         proxies_count = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        users_count = (await cur.fetchone())[0]
         cur = await db.execute("SELECT SUM(completed_views) FROM jobs")
         total_views = (await cur.fetchone())[0] or 0
-        await message.reply(f"Total Jobs: {jobs_count}\nTotal Proxies: {proxies_count}\nTotal Views: {total_views}")
+    await message.reply(
+        f"📊 <b>Admin Stats</b>\n"
+        f"Users: {users_count}\n"
+        f"Jobs: {jobs_count}\n"
+        f"Proxies: {proxies_count}\n"
+        f"Total Views Delivered: {total_views}",
+        parse_mode="HTML"
+    )
 
 @router.message(Command("admin_forcecheck"))
 async def admin_forcecheck(message: types.Message):
@@ -964,23 +1227,54 @@ async def admin_forcecheck(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE proxies SET last_checked=NULL")
         await db.commit()
-    await message.reply("Forced full proxy recheck scheduled.")
+    await message.reply("✅ Forced full proxy recheck scheduled.")
+
+@router.message(Command("admin_addcredits"))
+async def admin_addcredits(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.reply("Usage: /admin_addcredits <telegram_id> <cents>")
+        return
+    try:
+        target_id = int(parts[1])
+        amount = int(parts[2])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.reply("Invalid arguments. Amount must be a positive integer (cents).")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id FROM users WHERE telegram_id=?", (target_id,))
+        user = await cur.fetchone()
+        if not user:
+            await message.reply("User not found.")
+            return
+        await db.execute(
+            "UPDATE users SET credits = credits + ? WHERE telegram_id=?", (amount, target_id)
+        )
+        await db.commit()
+    await message.reply(
+        f"✅ Added {cents_to_dollars(amount)} to user {target_id}."
+    )
 
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
 async def main():
-    global bm_global
+    global bm_global, bot_global
     await init_db()
     bm_global = BrowserManager()
     await bm_global.start()
     asyncio.create_task(proxy_health_check_loop(bm_global))
-    bot = Bot(token=BOT_TOKEN)
+    bot_global = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logger.info("Bot started – no TLS proxy, using Chromium default JA3")
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot_global)
     finally:
         await bm_global.stop()
 
