@@ -1,8 +1,11 @@
-// tls_proxy.go – TLS fingerprint rotation proxy (works with utls v1.5.0+)
+// tls_proxy.go – TLS fingerprint rotation proxy (secure, production‑ready)
 // Build:
-//   go mod init tlsproxy   (if not already done)
+//   go mod init tlsproxy
 //   go get github.com/refraction-networking/utls@v1.5.0
 //   go build -o tls_proxy tls_proxy.go
+//
+// Environment:
+//   PROXY_AUTH_TOKEN – required shared secret (any non‑empty string)
 
 package main
 
@@ -15,7 +18,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -23,9 +28,40 @@ import (
 
 var listenAddr = flag.String("listen", "127.0.0.1:8080", "Address to listen on")
 
-// Fingerprint map – all constants exist in utls v1.5.0
+// --- Authentication ---
+var authToken = os.Getenv("PROXY_AUTH_TOKEN")
+
+func init() {
+	if authToken == "" {
+		log.Fatal("PROXY_AUTH_TOKEN must be set in environment")
+	}
+}
+
+// validateAuth checks that the Proxy-Authorization header contains the token as password.
+// Format: Basic base64(anything:TOKEN)
+func validateAuth(r *http.Request) bool {
+	auth := r.Header.Get("Proxy-Authorization")
+	if auth == "" {
+		return false
+	}
+	const prefix = "Basic "
+	if !strings.HasPrefix(auth, prefix) {
+		return false
+	}
+	payload, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return false
+	}
+	parts := strings.SplitN(string(payload), ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	// The password part must match our secret token
+	return parts[1] == authToken
+}
+
+// --- Fingerprint map ---
 var fingerprintMap = map[string]utls.ClientHelloID{
-	// Chrome versions → HelloChrome_100 (latest Chrome in utls v1.5.0)
 	"chrome_108":         utls.HelloChrome_100,
 	"chrome_109":         utls.HelloChrome_100,
 	"chrome_110":         utls.HelloChrome_100,
@@ -37,7 +73,6 @@ var fingerprintMap = map[string]utls.ClientHelloID{
 	"chrome_112_windows": utls.HelloChrome_100,
 	"chrome_112_mac":     utls.HelloChrome_100,
 
-	// Firefox versions → HelloFirefox_99 (latest Firefox in utls v1.5.0)
 	"firefox_115": utls.HelloFirefox_99,
 	"firefox_116": utls.HelloFirefox_99,
 	"firefox_117": utls.HelloFirefox_99,
@@ -45,14 +80,15 @@ var fingerprintMap = map[string]utls.ClientHelloID{
 	"firefox_119": utls.HelloFirefox_99,
 	"firefox_121": utls.HelloFirefox_99,
 
-	// Safari versions → HelloSafari_14
 	"safari_15_5": utls.HelloSafari_14,
 	"safari_16_0": utls.HelloSafari_14,
 	"safari_16_1": utls.HelloSafari_14,
 	"safari_17_0": utls.HelloSafari_14,
 }
 
-func parseBasicAuth(authHeader string) (username, password string) {
+// parseBasicAuth extracts username (upstream URL) and fingerprint ID from auth header.
+// Expected format: base64("upstream_url:fingerprint_id") – password part is the token (ignored here).
+func parseBasicAuth(authHeader string) (upstreamURL, fpID string) {
 	const prefix = "Basic "
 	if !strings.HasPrefix(authHeader, prefix) {
 		return
@@ -62,11 +98,14 @@ func parseBasicAuth(authHeader string) (username, password string) {
 	if len(pair) != 2 {
 		return
 	}
+	// username part is the upstream URL (if any)
 	decoded, err := url.PathUnescape(pair[0])
 	if err != nil {
 		decoded = pair[0]
 	}
-	return decoded, pair[1]
+	upstreamURL = decoded
+	fpID = pair[1] // fingerprint is the "password"
+	return
 }
 
 func dialUpstream(upstreamURL, target string) (net.Conn, error) {
@@ -121,10 +160,17 @@ func main() {
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {
+	// Require authentication
+	if !validateAuth(r) {
+		http.Error(w, "unauthorized", http.StatusProxyAuthRequired)
+		return
+	}
+
 	fpID := "chrome_120" // default
 	var upstreamURL string
-	if auth := r.Header.Get("Proxy-Authorization"); auth != "" {
-		upstreamURL, fpID = parseBasicAuth(auth)
+	authHeader := r.Header.Get("Proxy-Authorization")
+	if authHeader != "" {
+		upstreamURL, fpID = parseBasicAuth(authHeader)
 	}
 
 	helloID, ok := fingerprintMap[fpID]
@@ -145,8 +191,15 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Extract server name correctly for TLS, handling IPv6
+	host, _, err := net.SplitHostPort(r.URL.Host)
+	if err != nil {
+		// If no port, use the whole thing
+		host = r.URL.Host
+	}
+
 	tlsConn := utls.UClient(targetConn, &utls.Config{
-		ServerName: strings.Split(r.URL.Host, ":")[0],
+		ServerName: host,
 	}, helloID)
 	if err := tlsConn.Handshake(); err != nil {
 		targetConn.Close()
@@ -168,8 +221,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	go io.Copy(tlsConn, clientConn)
+	// Bidirectional copy with proper cleanup
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		io.Copy(tlsConn, clientConn)
+	}()
 	io.Copy(clientConn, tlsConn)
+	// Close both connections after one direction ends
+	tlsConn.Close()
+	clientConn.Close()
+	wg.Wait() // ensure goroutine finished
 }
 
 func handleTest(w http.ResponseWriter, r *http.Request) {
